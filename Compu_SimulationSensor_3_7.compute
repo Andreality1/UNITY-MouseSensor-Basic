@@ -1,0 +1,350 @@
+#pragma kernel CSMain
+#pragma kernel CSSensor
+
+#define SAMPLES_PER_FRAME 64
+
+// --- Plane settings (driven from the Unity Inspector) ---
+float3 _SensorCenter;        
+float2 _SensorHalfSize;      
+float2 _SensorGridCells;     
+float  _SensorGridEnabled;   
+int    _GridDisplayMode;     // 0 = Surface Plane Only, 1 = Grid Only, 2 = Both Combined
+float  _SensorLineWidth;     
+float  _SensorBorderWidth;   
+float4 _SensorColor;         
+float4 _SensorGridColor;     
+float4 _SensorBorderColor;   
+
+// Rough surface patch
+float3 _PatchCenter;         
+float  _PatchHalfSize;       
+float  _PatchAmplitude;      
+float  _PatchNoiseFrequency; 
+float4 _PatchLowColor;       
+float4 _PatchHighColor;      
+
+// Mouse optics (kept for structural parameters, though optics rendering is disabled)
+float  _LensY;               
+float  _LensRadius;          
+float  _SensorImageDist;     
+float  _ObjectDist;          
+int    _SensorSamples;       
+float  _SensorBlend;         
+float  _ShowSensorImage;     
+float  _SensorExposure;      
+float  _ShowOptics;          
+
+struct Ray {
+    float3 origin;
+    float3 direction;
+    float wavelength; 
+};
+
+struct HitRecord {
+    bool didIntersect;
+    float t;
+    float3 position;
+    float3 normal;
+    int materialID;    
+};
+
+// --- Buffers & Textures ---
+RWTexture2D<float4> Result;              
+RWTexture2D<float4> AccumulationBuffer;  
+RWTexture2D<float4> SensorImage;         
+
+// --- Uniforms & Transform Matrices ---
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+float _Time;
+int _SampleIndex;
+
+float4 _LightPosition;
+float _LightIntensity; 
+float _IntensityClamp; 
+
+// --- PRNG Subsystem ---
+uint GenerateSeed(uint2 id, uint width, float time) {
+    uint timeSeed = asuint(time);
+    uint state = id.y * width + id.x;
+    state ^= timeSeed;
+    state = state * 277803737u + 289133645u;
+    return state;
+}
+
+float NextRandom(inout uint state) {
+    state = state * 747796405u + 289133645u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (float)((word >> 22u) ^ word) / 4294967295.0f;
+}
+
+float Hash21(float2 p) {
+    float3 p3 = frac(float3(p.x, p.y, p.x) * 0.1031f);
+    p3 += dot(p3, p3.yzx + 33.33f);
+    return frac((p3.x + p3.y) * p3.z);
+}
+
+// Generates a random RGB color per tile cell coordinates
+float3 TileRandomColor(float2 cellCoords) {
+    float r = Hash21(cellCoords + float2(12.9898f, 78.233f));
+    float g = Hash21(cellCoords + float2(39.3464f, 11.135f));
+    float b = Hash21(cellCoords + float2(73.156f,  52.231f));
+    return float3(r, g, b);
+}
+
+float ValueNoise(float2 p) {
+    float2 i = floor(p);
+    float2 f = frac(p);
+    f = f * f * (3.0f - 2.0f * f); 
+    float a = Hash21(i);
+    float b = Hash21(i + float2(1, 0));
+    float c = Hash21(i + float2(0, 1));
+    float d = Hash21(i + float2(1, 1));
+    return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+}
+
+float SurfaceHeight(float2 xz) {
+    float h = 0.0f;
+    float amp = 0.5f;
+    float freq = _PatchNoiseFrequency;
+    [unroll]
+    for (int o = 0; o < 3; o++) {      
+        h += ValueNoise(xz * freq) * amp;
+        freq *= 2.0f;
+        amp *= 0.5f;
+    }
+    return h * _PatchAmplitude * 2.0f;
+}
+
+float3 WavelengthToXYZ(float wave) {
+    float x1 = 1.065f * exp(-0.5f * ((wave - 595.8f) / 33.4f) * ((wave - 595.8f) / 33.4f));
+    float x2 = 0.366f * exp(-0.5f * ((wave - 446.8f) / 18.2f) * ((wave - 446.8f) / 18.2f));
+    return float3(x1 + x2, 1.014f * exp(-0.5f * ((wave - 556.4f) / 40.4f) * ((wave - 556.4f) / 40.4f)), 1.839f * exp(-0.5f * ((wave - 446.8f) / 22.7f) * ((wave - 446.8f) / 22.7f)));
+}
+
+float3 XYZToRGB(float3 xyz) {
+    return float3(2.975424f * xyz.x - 1.402930f * xyz.y - 0.453346f * xyz.z, -0.923164f * xyz.x + 1.832263f * xyz.y + 0.035174f * xyz.z, 0.053158f * xyz.x - 1.936616f * xyz.y + 1.050730f * xyz.z);
+}
+
+// --- Rough Patch Intersection ---
+void IntersectRoughPatch(Ray ray, inout HitRecord bestHit, float3 center, float halfSize, int matID) {
+    float minY = center.y;
+    float maxY = center.y + _PatchAmplitude * 2.0f;
+
+    float3 bmin = float3(center.x - halfSize, minY, center.z - halfSize);
+    float3 bmax = float3(center.x + halfSize, maxY, center.z + halfSize);
+    float3 invD = 1.0f / ray.direction;
+    float3 t0 = (bmin - ray.origin) * invD;
+    float3 t1 = (bmax - ray.origin) * invD;
+    float3 tsm = min(t0, t1);
+    float3 tbg = max(t0, t1);
+    float tEnter = max(max(tsm.x, tsm.y), max(tsm.z, 0.001f));
+    float tExit  = min(min(tbg.x, tbg.y), tbg.z);
+    if (tEnter >= tExit || tEnter > bestHit.t) return;
+
+    const int STEPS = 64;
+    float dt = (tExit - tEnter) / (float)STEPS;
+    float tPrev = tEnter;
+    float3 pPrev = ray.origin + tPrev * ray.direction;
+    float hPrev = pPrev.y - (center.y + SurfaceHeight(pPrev.xz - center.xz));
+
+    [loop]
+    for (int s = 1; s <= STEPS; s++) {
+        float tCur = tEnter + dt * s;
+        float3 pCur = ray.origin + tCur * ray.direction;
+        float hCur = pCur.y - (center.y + SurfaceHeight(pCur.xz - center.xz));
+
+        if (hPrev > 0.0f && hCur <= 0.0f) {
+            float tLo = tPrev, tHi = tCur;
+            [unroll]
+            for (int b = 0; b < 5; b++) {
+                float tMid = 0.5f * (tLo + tHi);
+                float3 pm = ray.origin + tMid * ray.direction;
+                float hm = pm.y - (center.y + SurfaceHeight(pm.xz - center.xz));
+                if (hm > 0.0f) tLo = tMid; else tHi = tMid;
+            }
+            float tHit = 0.5f * (tLo + tHi);
+
+            if (tHit < bestHit.t) {
+                float3 pos = ray.origin + tHit * ray.direction;
+                float2 q = pos.xz - center.xz;
+                float e = 0.005f;
+                float h0 = SurfaceHeight(q);
+                float hx = SurfaceHeight(q + float2(e, 0)) - h0;
+                float hz = SurfaceHeight(q + float2(0, e)) - h0;
+                bestHit.didIntersect = true;
+                bestHit.t = tHit;
+                bestHit.position = pos;
+                bestHit.normal = normalize(float3(-hx, e, -hz));
+                bestHit.materialID = matID;
+            }
+            return;
+        }
+        tPrev = tCur;
+        hPrev = hCur;
+    }
+}
+
+// Surface shading with diagonal tile colors and pure black grid lines
+float3 PatchColor(float3 pos, float3 normal) {
+    float3 L = normalize(_LightPosition.xyz - pos);
+    float ndl = saturate(dot(normal, L));
+    
+    // Calculate grid cell indices in world space
+    float2 cells = max(_SensorGridCells, float2(1.0f, 1.0f));
+    float2 gridUV = (pos.xz - _PatchCenter.xz + _PatchHalfSize) / (2.0f * _PatchHalfSize); 
+    gridUV = saturate(gridUV);
+    float2 gridScaled = gridUV * cells;
+    float2 cellIndex = floor(gridScaled);
+
+    // Combine x and y indices into a single diagonal stripe coordinate
+    float diagonalID = cellIndex.x + cellIndex.y;
+    float2 diagonalCoords = float2(diagonalID, diagonalID);
+    float3 tileColor = TileRandomColor(diagonalCoords);
+
+    // Grid boundary line check
+    float2 cellFrac = frac(gridScaled);
+    float2 distToLine = min(cellFrac, 1.0f - cellFrac);
+    float2 strokeWidth = float2(_SensorLineWidth, _SensorLineWidth) * 0.5f;
+    bool onLine = (distToLine.x < strokeWidth.x || distToLine.y < strokeWidth.y);
+
+    float3 finalColor = tileColor;
+    if (_SensorGridEnabled > 0.5f) {
+        float3 blackGridColor = float3(0.0f, 0.0f, 0.0f);
+
+        if (_GridDisplayMode == 0) {
+            finalColor = tileColor;
+        } else if (_GridDisplayMode == 1) {
+            finalColor = onLine ? blackGridColor : float3(0.05f, 0.05f, 0.05f);
+        } else {
+            if (onLine) {
+                finalColor = blackGridColor;
+            }
+        }
+    }
+
+    return finalColor * (0.15f + 1.5f * ndl);
+}
+
+// --- Sensor simulation kernel ---
+[numthreads(8, 8, 1)]
+void CSSensor(uint3 id : SV_DispatchThreadID) {
+    uint w, h;
+    SensorImage.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+
+    uint rng = GenerateSeed(id.xy, w, _Time);
+    float3 C = float3(_SensorCenter.x, _LensY, _SensorCenter.z);
+    float sum = 0.0f;
+
+    [loop]
+    for (int smp = 0; smp < _SensorSamples; smp++) {
+        float2 pix = (float2(id.xy) + float2(NextRandom(rng), NextRandom(rng))) / float2(w, h);   
+        float3 P = float3(_SensorCenter.x + (pix.x * 2.0f - 1.0f) * _SensorHalfSize.x,
+                          _SensorCenter.y,
+                          _SensorCenter.z + (pix.y * 2.0f - 1.0f) * _SensorHalfSize.y);
+
+        float r = _LensRadius * sqrt(NextRandom(rng));
+        float a = 6.2831853f * NextRandom(rng);
+        float3 L = C + float3(r * cos(a), 0.0f, r * sin(a));          
+
+        float3 F = C + (C - P) * (_ObjectDist / _SensorImageDist);    
+
+        Ray ray;
+        ray.origin = L;
+        ray.direction = normalize(F - L);
+        ray.wavelength = 0.0f;
+
+        HitRecord hit;
+        hit.didIntersect = false;
+        hit.t = 1e20f;
+        hit.position = float3(0, 0, 0);
+        hit.normal = float3(0, 0, 0);
+        hit.materialID = 0;
+        IntersectRoughPatch(ray, hit, _PatchCenter, _PatchHalfSize, 9);
+
+        if (hit.didIntersect) {
+            float3 c = PatchColor(hit.position, hit.normal);
+            sum += dot(c, float3(0.299f, 0.587f, 0.114f));            
+        }
+    }
+
+    float value = sum / (float)max(_SensorSamples, 1);
+    float prev = SensorImage[id.xy].r;
+    float blended = lerp(prev, value, saturate(_SensorBlend));
+    SensorImage[id.xy] = float4(blended, blended, blended, 1.0f);
+}
+
+// --- Main Raytracing Kernel (Isolated Rough Surface Only) ---
+[numthreads(32, 32, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID) {
+    uint width, height;
+    Result.GetDimensions(width, height);
+    if (id.x >= width || id.y >= height) return;
+    
+    uint rngState = GenerateSeed(id.xy, width, _Time);
+    float2 uvJitterAA = (float2(id.xy) + float2(NextRandom(rngState), NextRandom(rngState))) / float2(width, height);
+    
+    float4 jitterClip = float4(uvJitterAA.x * 2.0f - 1.0f, uvJitterAA.y * 2.0f - 1.0f, 0.0f, 1.0f);
+    float4 jitterView = mul(_CameraInverseProjection, jitterClip); 
+    jitterView /= jitterView.w;
+    
+    Ray jitterRay; 
+    jitterRay.origin = _CameraToWorld._m03_m13_m23;
+    jitterRay.direction = normalize(mul(_CameraToWorld, float4(jitterView.xyz, 0.0f)).xyz);
+    jitterRay.wavelength = 0.0f;
+
+    float3 accumulatedFrameRGB = float3(0.0f, 0.0f, 0.0f);
+    int primaryHits = 0;
+
+    HitRecord patchHit;
+    patchHit.didIntersect = false;
+    patchHit.t = 1e20f;
+    patchHit.position = float3(0, 0, 0);
+    patchHit.normal = float3(0, 0, 0);
+    patchHit.materialID = 0;
+    IntersectRoughPatch(jitterRay, patchHit, _PatchCenter, _PatchHalfSize, 9); 
+
+    [loop]
+    for (int smpl = 0; smpl < SAMPLES_PER_FRAME; smpl++) 
+    {
+        Ray ray;
+        ray.origin = jitterRay.origin;
+        ray.direction = jitterRay.direction;
+        ray.wavelength = 380.0f + NextRandom(rngState) * 400.0f;
+        
+        float throughput = 1.0f;
+        float finalSpectralRadiance = 0.0f;
+
+        // Only test against the rough patch intersection
+        HitRecord hit;
+        hit.didIntersect = false; 
+        hit.t = 1e20f;
+        hit.position = float3(0, 0, 0);
+        hit.normal = float3(0, 0, 0);
+        hit.materialID = 0;
+
+        if (patchHit.didIntersect) {
+            hit = patchHit;
+            primaryHits++;
+        }
+
+        if (hit.didIntersect) {
+            float3 sceneSampleRGB = PatchColor(hit.position, hit.normal) * throughput;
+            accumulatedFrameRGB += max(sceneSampleRGB, 0.0f);
+        }
+    }
+
+    float3 frameRGB = accumulatedFrameRGB / (float)SAMPLES_PER_FRAME;
+
+    float4 prevAccum = AccumulationBuffer[id.xy];
+    float prevCount = min(prevAccum.w, (float)(_SampleIndex - 1));
+
+    float blendFactor = 1.0f / (prevCount + 1.0f);
+    float newCount = prevCount + 1.0f;
+
+    float3 accumulatedRGB = lerp(prevAccum.xyz, frameRGB, blendFactor);
+    AccumulationBuffer[id.xy] = float4(accumulatedRGB, newCount);
+    
+    Result[id.xy] = float4(pow(accumulatedRGB / (accumulatedRGB + 1.0f), 1.0f / 2.2f), 1.0f);
+}

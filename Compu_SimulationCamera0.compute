@@ -1,0 +1,544 @@
+#pragma kernel CS_RenderPinholeSensor
+#pragma kernel CSMain
+
+#define SAMPLES_PER_FRAME 96
+
+struct Ray {
+    float3 origin;
+    float3 direction;
+    float wavelength; 
+};
+
+struct HitRecord {
+    bool didIntersect;
+    float t;
+    float3 position;
+    float3 normal;
+    int materialID;    
+};
+
+// --- Buffers & Textures ---
+Texture2D<float4> BackgroundSource;      
+Texture2D<float> _CameraDepthTexture;    
+RWTexture2D<float4> Result;              
+RWTexture2D<float4> AccumulationBuffer;
+RWTexture2D<float4> SensorBuffer;        
+
+SamplerState sampler_linear_clamp;
+
+// --- Uniforms & Transform Matrices ---
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+float4 _ZBufferParams;
+float _Time;
+int _SampleIndex;
+
+float4x4 _SensorLocalToWorld;
+float4x4 _SensorWorldToLocal;
+float2 _SensorExtents; 
+float _PinholeDistance; 
+
+float4x4 _PrismWorldToLocal;
+float4x4 _PrismLocalToWorld;
+float4 _LightPosition;
+float _LightIntensity; 
+
+// UNIFORM: Passing this dynamically breaks compiler analysis loops and forces instant loading
+float _IntensityClamp; 
+
+// --- PRNG Subsystem ---
+uint GenerateSeed(uint2 id, uint width, float time) {
+    uint timeSeed = asuint(time);
+    uint state = id.y * width + id.x;
+    state ^= timeSeed;
+    state = state * 277803737u + 289133645u;
+    return state;
+}
+
+float NextRandom(inout uint state) {
+    state = state * 747796405u + 289133645u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (float)((word >> 22u) ^ word) / 4294967295.0f;
+}
+
+float3 RandomInUnitSphere(inout uint state) {
+    while (true) {
+        float3 p = float3(NextRandom(state)*2.0f-1.0f, NextRandom(state)*2.0f-1.0f, NextRandom(state)*2.0f-1.0f);
+        if (dot(p, p) < 1.0f) return p;
+    }
+    return float3(0,0,0);
+}
+
+uint Hash1D(int value) {
+    uint x = asuint(value);
+    uint hash = x * 73856093u ^ 19349663u;
+    hash = (hash ^ (hash >> 16)) * 451351241u;
+    return (hash ^ (hash >> 15)) * 132412589u;
+}
+
+// --- Spectral Curve Data Evaluation ---
+float EvaluateSpectralReflectance(int matID, float wavelength, float3 hitPosition) {
+    if (matID == 1) {
+        return lerp(0.01f, 0.98f, smoothstep(580.0f, 610.0f, wavelength));
+    }
+    if (matID == 7) {
+        return 1.0f;
+    }
+    if (matID == 2 || matID == 3) {
+        return 1.0f;
+    }
+    if (matID == 5) return 1.0f;
+    if (matID == 6) return 1.0f;
+    return 0.0f;
+}
+
+float EvaluateEmission(int matID, float wavelength) {
+    if (matID == 4) return _LightIntensity; 
+    return 0.0f;
+}
+
+float EvaluateSkyEmission(float wavelength, float3 rayDir) {
+    return 0.0f;
+}
+
+float3 WavelengthToXYZ(float wave) {
+    float x1 = 1.065f * exp(-0.5f * ((wave - 595.8f) / 33.4f) * ((wave - 595.8f) / 33.4f));
+    float x2 = 0.366f * exp(-0.5f * ((wave - 446.8f) / 18.2f) * ((wave - 446.8f) / 18.2f));
+    return float3(x1 + x2, 1.014f * exp(-0.5f * ((wave - 556.4f) / 40.4f) * ((wave - 556.4f) / 40.4f)), 1.839f * exp(-0.5f * ((wave - 446.8f) / 22.7f) * ((wave - 446.8f) / 22.7f)));
+}
+
+float3 XYZToRGB(float3 xyz) {
+    return float3(2.975424f * xyz.x - 1.402930f * xyz.y - 0.453346f * xyz.z, -0.923164f * xyz.x + 1.832263f * xyz.y + 0.035174f * xyz.z, 0.053158f * xyz.x - 1.936616f * xyz.y + 1.050730f * xyz.z);
+}
+
+// --- Intersections ---
+void IntersectSphere(Ray ray, inout HitRecord bestHit, float3 center, float radius, int matID) {
+    float3 oc = ray.origin - center;
+    float b = dot(oc, ray.direction);
+    float c = dot(oc, oc) - radius * radius;
+    float discriminant = b * b - c;
+    if (discriminant < 0.0f) return;
+    float t = -b - sqrt(discriminant);
+    if (t <= 0.001f) t = -b + sqrt(discriminant);
+    if (t > 0.001f && t < bestHit.t) {
+        bestHit.didIntersect = true;
+        bestHit.t = t;
+        bestHit.position = ray.origin + t * ray.direction;
+        bestHit.normal = normalize(bestHit.position - center);
+        bestHit.materialID = matID;
+    }
+}
+
+void IntersectPlane(Ray ray, inout HitRecord bestHit, float3 planeOrigin, float3 planeNormal, int matID) {
+    float denom = dot(planeNormal, ray.direction);
+    if (abs(denom) > 1e-6f) {
+        float t = dot(planeOrigin - ray.origin, planeNormal) / denom;
+        if (t > 0.001f && t < bestHit.t) {
+            bestHit.didIntersect = true;
+            bestHit.t = t;
+            bestHit.position = ray.origin + t * ray.direction;
+            bestHit.normal = planeNormal; 
+            bestHit.materialID = matID;
+        }
+    }
+}
+
+void IntersectTriangularPrism(Ray ray, inout HitRecord bestHit, int matID) {
+    float3 localOrigin = mul(_PrismWorldToLocal, float4(ray.origin, 1.0f)).xyz;
+    float3 localDirection = mul(_PrismWorldToLocal, float4(ray.direction, 0.0f)).xyz;
+    float lengthDir = length(localDirection);
+    localDirection /= lengthDir;
+
+    float width = 1.5f;
+    float lengthExt = 2.5f;
+    float h = width * 0.8660254f;
+    float r_in = h / 3.0f;
+    float r_out = h * (2.0f / 3.0f);
+    
+    float3 normals[5] = { float3(0, -1, 0), float3(0, 0.5f, 0.8660254f), float3(0, 0.5f, -0.8660254f), float3(1, 0, 0), float3(-1, 0, 0) };
+    float3 positions[5] = { float3(0, -r_in, 0), float3(0, r_out, 0), float3(0, r_out, 0), float3(lengthExt * 0.5f, 0, 0), float3(-lengthExt * 0.5f, 0, 0) };
+    float t_near = -1e20f; 
+    float t_far = 1e20f; 
+    int hit_idx = -1;
+
+    for (int i = 0; i < 5; i++) {
+        float denom = dot(normals[i], localDirection);
+        if (abs(denom) > 1e-6f) {
+            float t = dot(positions[i] - localOrigin, normals[i]) / denom;
+            if (denom < 0.0f) { 
+                if (t > t_near) { 
+                    t_near = t; 
+                    hit_idx = i;
+                } 
+            }
+            else { 
+                if (t < t_far) t_far = t;
+            }
+        } else { 
+            if (dot(localOrigin - positions[i], normals[i]) > 0.0f) return;
+        }
+    }
+    
+    if (t_near < t_far && t_near > 0.001f) {
+        float worldT = t_near / lengthDir;
+        if (worldT < bestHit.t && hit_idx != -1) {
+            bestHit.didIntersect = true;
+            bestHit.t = worldT; 
+            bestHit.position = ray.origin + worldT * ray.direction;
+            float3 worldNormal = normalize(mul((float3x3)_PrismWorldToLocal, normals[hit_idx]));
+            if (dot(ray.direction, worldNormal) > 0.0f) worldNormal = -worldNormal;
+            bestHit.normal = worldNormal; 
+            bestHit.materialID = matID;
+        }
+    }
+}
+
+void IntersectTransformedSensorPlane(Ray ray, inout HitRecord bestHit, int matID) {
+    float3 localOrigin = mul(_SensorWorldToLocal, float4(ray.origin, 1.0f)).xyz;
+    float3 localDirection = normalize(mul(_SensorWorldToLocal, float4(ray.direction, 0.0f)).xyz);
+    float denom = localDirection.y;
+    if (abs(denom) > 1e-6f) {
+        float t = -localOrigin.y / denom;
+        if (t > 0.001f && t < bestHit.t) {
+            float3 localHitPos = localOrigin + t * localDirection;
+            if (abs(localHitPos.x) <= _SensorExtents.x && abs(localHitPos.z) <= _SensorExtents.y) {
+                bestHit.didIntersect = true;
+                bestHit.t = t; 
+                bestHit.position = ray.origin + t * ray.direction;
+                bestHit.normal = normalize(mul(_SensorLocalToWorld, float4(0.0f, 1.0f, 0.0f, 0.0f)).xyz); 
+                bestHit.materialID = matID;
+            }
+        }
+    }
+}
+
+// =========================================================================
+// RENDER PASS 1: SCALED PINHOLE SIMULATION RENDER ENGINE
+// =========================================================================
+[numthreads(32, 32, 1)]
+void CS_RenderPinholeSensor(uint3 id : SV_DispatchThreadID) {
+    uint sWidth, sHeight;
+    SensorBuffer.GetDimensions(sWidth, sHeight);
+    if (id.x >= sWidth || id.y >= sHeight) return;
+
+    uint rngState = GenerateSeed(id.xy, sWidth, _Time + 11.123f);
+    float2 sensorUV = (float2(id.xy) + float2(NextRandom(rngState), NextRandom(rngState))) / float2(sWidth, sHeight);
+    float2 localCoord = (sensorUV - 0.5f) * 2.0f * _SensorExtents;
+    float3 localPixelPos = float3(localCoord.x, 0.0f, localCoord.y);
+    float3 pixelWorldPos = mul(_SensorLocalToWorld, float4(localPixelPos, 1.0f)).xyz;
+    float3 sensorNormal = normalize(mul(_SensorLocalToWorld, float4(0.0f, 1.0f, 0.0f, 0.0f)).xyz);
+    float3 sensorCenterWorld = mul(_SensorLocalToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+    float3 pinholeWorldPos = sensorCenterWorld + sensorNormal * _PinholeDistance;
+    float3 dirToPixel = normalize(pixelWorldPos - pinholeWorldPos);
+    float3 localX = normalize(mul(_SensorLocalToWorld, float4(1.0f, 0.0f, 0.0f, 0.0f)).xyz);
+    float3 localY = sensorNormal;
+    float3 localZ = normalize(mul(_SensorLocalToWorld, float4(0.0f, 0.0f, 1.0f, 0.0f)).xyz);
+    float3x3 sensorBasis = float3x3(localX, localY, localZ);
+    
+    float3 localDirToPixel = mul(sensorBasis, dirToPixel);
+    float3 localSceneDir = float3(localDirToPixel.x, -localDirToPixel.y, localDirToPixel.z);
+    float3 sceneRayDirection = normalize(mul(localSceneDir, sensorBasis));
+
+    float3 accumulatedPinholeFrameRGB = float3(0.0f, 0.0f, 0.0f);
+
+    [loop]
+    for (int smpl = 0; smpl < SAMPLES_PER_FRAME; smpl++) {
+        Ray pinholeRay;
+        pinholeRay.origin = pinholeWorldPos; 
+        pinholeRay.direction = sceneRayDirection; 
+        pinholeRay.wavelength = 380.0f + NextRandom(rngState) * 400.0f;
+        float pinholeThroughput = 1.0f;
+        float pinholeSpectralRadiance = 0.0f;
+        int maxBounces = 7;
+
+        [loop]
+        for (int bounce = 0; bounce < maxBounces; bounce++) {
+            HitRecord hit;
+            hit.didIntersect = false; 
+            hit.t = 1e20f;
+            hit.position = float3(0, 0, 0);
+            hit.normal = float3(0, 0, 0);
+            hit.materialID = 0;
+
+            IntersectSphere(pinholeRay, hit, float3(-2.0f, 0.0f, 5.0f), 1.2f, 1);
+            IntersectTriangularPrism(pinholeRay, hit, 7);
+            IntersectPlane(pinholeRay, hit, float3(0.0f, -1.5f, 0.0f), float3(0.0f, 1.0f, 0.0f), 2);
+            IntersectSphere(pinholeRay, hit, _LightPosition.xyz, 0.2f, 4);
+
+            if (hit.didIntersect) {
+                if (hit.materialID == 4) {
+                    float rawEmission = EvaluateEmission(hit.materialID, pinholeRay.wavelength) * pinholeThroughput;
+                    pinholeSpectralRadiance += min(rawEmission, _IntensityClamp);
+                    break;
+                }
+                
+                if (hit.materialID == 1 || hit.materialID == 7) {
+                    float wNorm = pinholeRay.wavelength / 1000.0f;
+                    float iorGlass = 1.50f + 0.035f / (wNorm * wNorm);
+                    float3 incident = pinholeRay.direction;
+                    float roughness = 0.0f;
+                    if (hit.materialID == 1) roughness = 0.25f;
+                    
+                    float3 normal = normalize(hit.normal + RandomInUnitSphere(rngState) * roughness);
+                    float etaI = 1.0f;
+                    float etaT = iorGlass;
+                    bool isExiting = dot(incident, normal) > 0.0f;
+                    if (isExiting) {
+                        normal = -normal;
+                        etaI = iorGlass;
+                        etaT = 1.0f;
+                    }
+                    float eta = etaI / etaT;
+                    float cosThetaI = min(dot(-incident, normal), 1.0f);
+                    float sinThetaT2 = eta * eta * (1.0f - cosThetaI * cosThetaI);
+                    if (sinThetaT2 > 1.0f) {
+                        pinholeRay.direction = reflect(incident, normal);
+                        pinholeRay.origin = hit.position + normal * 0.001f;
+                    } else {
+                        float cosThetaT = sqrt(1.0f - sinThetaT2);
+                        float rOrth = (etaI * cosThetaI - etaT * cosThetaT) / (etaI * cosThetaI + etaT * cosThetaT);
+                        float rPar = (etaT * cosThetaI - etaI * cosThetaT) / (etaT * cosThetaI + etaI * cosThetaT);
+                        float fresnel = (rOrth * rOrth + rPar * rPar) * 0.5f;
+                        if (NextRandom(rngState) < fresnel) {
+                            pinholeRay.direction = reflect(incident, normal);
+                            pinholeRay.origin = hit.position + normal * 0.001f;
+                        } else {
+                            pinholeRay.direction = refract(incident, normal, eta);
+                            pinholeRay.origin = hit.position - normal * 0.001f;
+                        }
+                    }
+                    
+                    pinholeThroughput *= EvaluateSpectralReflectance(hit.materialID, pinholeRay.wavelength, hit.position);
+                    continue;
+                }
+                
+                if (hit.materialID == 2 || hit.materialID == 3) {
+                    float3 targetDir = normalize(hit.normal + RandomInUnitSphere(rngState));
+                    pinholeRay.direction = targetDir;
+                    pinholeRay.origin = hit.position + hit.normal * 0.001f;
+                    pinholeThroughput *= EvaluateSpectralReflectance(hit.materialID, pinholeRay.wavelength, hit.position);
+                    
+                    // OPTIMIZATION: Early Russian Roulette termination after 2 bounces
+                    if (bounce >= 2) {
+                        float continuationProbability = clamp(pinholeThroughput, 0.98f, 0.99f);
+                        if (NextRandom(rngState) > continuationProbability) break;
+                        pinholeThroughput /= continuationProbability;
+                    }
+                    continue;
+                }
+            } else {
+                pinholeSpectralRadiance += EvaluateSkyEmission(pinholeRay.wavelength, pinholeRay.direction) * pinholeThroughput;
+                break;
+            }
+        }
+        
+        float3 sampleRGB = max(XYZToRGB(WavelengthToXYZ(pinholeRay.wavelength) * pinholeSpectralRadiance * (400.0f * 0.00535f)), 0.0f);
+        sampleRGB = min(sampleRGB, float3(1e4f, 1e4f, 1e4f));
+        accumulatedPinholeFrameRGB += sampleRGB;
+    }
+    
+    SensorBuffer[id.xy] = float4(accumulatedPinholeFrameRGB / (float)SAMPLES_PER_FRAME, 1.0f);
+}
+
+// =========================================================================
+// RENDER PASS 2: MAIN SCREENSPACE INTEGRATION SYSTEM
+// =========================================================================
+[numthreads(32, 32, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID) {
+    uint width, height;
+    Result.GetDimensions(width, height);
+    if (id.x >= width || id.y >= height) return;
+    
+    uint rngState = GenerateSeed(id.xy, width, _Time);
+    float2 uvJitterAA = (float2(id.xy) + float2(NextRandom(rngState), NextRandom(rngState))) / float2(width, height);
+    float2 uvScreen = float2(id.xy) / float2(width, height);
+    float3 unityColor = BackgroundSource.SampleLevel(sampler_linear_clamp, uvScreen, 0).xyz;
+    float rawDepth = _CameraDepthTexture.SampleLevel(sampler_linear_clamp, uvScreen, 0);
+    float unityObjectDistance = 1.0f / (_ZBufferParams.z * rawDepth + _ZBufferParams.w);
+    if (unityObjectDistance >= 999.0f) unityColor = float3(0.0f, 0.0f, 0.0f);
+    bool fallbackToUnityRasterizer = false;
+    
+    float4 centerClip = float4(uvScreen.x * 2.0f - 1.0f, uvScreen.y * 2.0f - 1.0f, 0.0f, 1.0f);
+    float4 centerView = mul(_CameraInverseProjection, centerClip); 
+    centerView /= centerView.w;
+    
+    Ray centerRay; 
+    centerRay.origin = _CameraToWorld._m03_m13_m23; 
+    centerRay.direction = normalize(mul(_CameraToWorld, float4(centerView.xyz, 0.0f)).xyz);
+    centerRay.wavelength = 0.0f;
+
+    float4 jitterClip = float4(uvJitterAA.x * 2.0f - 1.0f, uvJitterAA.y * 2.0f - 1.0f, 0.0f, 1.0f);
+    float4 jitterView = mul(_CameraInverseProjection, jitterClip);
+    jitterView /= jitterView.w;
+    
+    Ray jitterRay; 
+    jitterRay.origin = centerRay.origin; 
+    jitterRay.direction = normalize(mul(_CameraToWorld, float4(jitterView.xyz, 0.0f)).xyz);
+    jitterRay.wavelength = 0.0f;
+
+    float3 sensorNormal = normalize(mul(_SensorLocalToWorld, float4(0.0f, 1.0f, 0.0f, 0.0f)).xyz);
+    float3 sensorCenterWorld = mul(_SensorLocalToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+    float3 pinholeWorldPos = sensorCenterWorld + sensorNormal * _PinholeDistance;
+
+    HitRecord centerHit; 
+    centerHit.didIntersect = false; 
+    centerHit.t = 1e20f;
+    centerHit.position = float3(0, 0, 0);
+    centerHit.normal = float3(0, 0, 0);
+    centerHit.materialID = 0;
+
+    IntersectSphere(centerRay, centerHit, float3(-2.0f, 0.0f, 5.0f), 1.2f, 1);
+    IntersectTriangularPrism(centerRay, centerHit, 7);
+    IntersectPlane(centerRay, centerHit, float3(0.0f, -1.5f, 0.0f), float3(0.0f, 1.0f, 0.0f), 2);
+    IntersectSphere(centerRay, centerHit, _LightPosition.xyz, 0.2f, 4);
+    IntersectTransformedSensorPlane(centerRay, centerHit, 5);
+    IntersectSphere(centerRay, centerHit, pinholeWorldPos, 0.08f, 6);
+    
+    if ((centerHit.didIntersect && centerHit.t > unityObjectDistance) || (!centerHit.didIntersect && unityObjectDistance < 999.0f)) fallbackToUnityRasterizer = true;
+    if (fallbackToUnityRasterizer) {
+        float blendFactor = 1.0f / (float)_SampleIndex;
+        float3 accumulatedRGB = lerp(AccumulationBuffer[id.xy].xyz, unityColor, blendFactor);
+        AccumulationBuffer[id.xy] = float4(accumulatedRGB, 1.0f);
+        Result[id.xy] = float4(pow(accumulatedRGB / (accumulatedRGB + 1.0f), 1.0f / 2.2f), 1.0f);
+        return;
+    }
+    if (centerHit.didIntersect && centerHit.materialID == 6) {
+        float blendFactor = 1.0f / (float)_SampleIndex;
+        float3 yellowColor = float3(1.0f, 0.9f, 0.0f);
+        float3 accumulatedRGB = lerp(AccumulationBuffer[id.xy].xyz, yellowColor, blendFactor);
+        AccumulationBuffer[id.xy] = float4(accumulatedRGB, 1.0f);
+        Result[id.xy] = float4(pow(accumulatedRGB, 1.0f / 2.2f), 1.0f);
+        return;
+    }
+
+    float2 sensorUV = uvJitterAA;
+    float3 collectedSensorRGB = float3(0.0f, 0.0f, 0.0f);
+    bool sensorPlaneHit = false;
+    if (centerHit.didIntersect && centerHit.materialID == 5) {
+        sensorPlaneHit = true;
+        float3 localHitPos = mul(_SensorWorldToLocal, float4(centerHit.position, 1.0f)).xyz;
+        float2 hitUV = (localHitPos.xz / _SensorExtents + 1.0f) * 0.5f;
+        uint sWidth, sHeight;
+        SensorBuffer.GetDimensions(sWidth, sHeight);
+        uint2 sensorTexel = uint2(hitUV * float2(sWidth, sHeight));
+        collectedSensorRGB = SensorBuffer[sensorTexel].xyz;
+    }
+
+    float3 accumulatedFrameRGB = float3(0.0f, 0.0f, 0.0f);
+    float skyPixelsAccumulator = 0.0f;
+
+    [loop]
+    for (int smpl = 0; smpl < SAMPLES_PER_FRAME; smpl++) {
+        Ray ray;
+        ray.origin = jitterRay.origin;
+        ray.direction = jitterRay.direction;
+        ray.wavelength = 380.0f + NextRandom(rngState) * 400.0f;
+        
+        float throughput = 1.0f;
+        float finalSpectralRadiance = 0.0f;
+        bool sampleHitSkyDirectly = false;
+        int maxBounces = 7;
+
+        [loop]
+        for (int i = 0; i < maxBounces; i++) {
+            HitRecord hit;
+            hit.didIntersect = false; 
+            hit.t = 1e20f;
+            hit.position = float3(0, 0, 0);
+            hit.normal = float3(0, 0, 0);
+            hit.materialID = 0;
+
+            IntersectSphere(ray, hit, float3(-2.0f, 0.0f, 5.0f), 1.2f, 1);
+            IntersectTriangularPrism(ray, hit, 7);
+            IntersectPlane(ray, hit, float3(0.0f, -1.5f, 0.0f), float3(0.0f, 1.0f, 0.0f), 2);
+            IntersectSphere(ray, hit, _LightPosition.xyz, 0.2f, 4);
+
+            if (hit.didIntersect) {
+                if (hit.materialID == 4) {
+                    float rawEmission = EvaluateEmission(hit.materialID, ray.wavelength) * throughput;
+                    finalSpectralRadiance += min(rawEmission, _IntensityClamp);
+                    break;
+                }
+                
+                if (hit.materialID == 1 || hit.materialID == 7) {
+                    float wNorm = ray.wavelength / 1000.0f;
+                    float iorGlass = 1.50f + 0.035f / (wNorm * wNorm);
+                    float3 incident = ray.direction;
+                    float roughness = 0.0f;
+                    if (hit.materialID == 1) roughness = 0.25f;
+
+                    float3 normal = normalize(hit.normal + RandomInUnitSphere(rngState) * roughness);
+                    float etaI = 1.0f;
+                    float etaT = iorGlass;
+                    bool isExiting = dot(incident, normal) > 0.0f;
+                    if (isExiting) {
+                        normal = -normal;
+                        etaI = iorGlass;
+                        etaT = 1.0f;
+                    }
+                    float eta = etaI / etaT;
+                    float cosThetaI = min(dot(-incident, normal), 1.0f);
+                    float sinThetaT2 = eta * eta * (1.0f - cosThetaI * cosThetaI);
+                    if (sinThetaT2 > 1.0f) {
+                        ray.direction = reflect(incident, normal);
+                        ray.origin = hit.position + normal * 0.001f;
+                    } else {
+                        float cosThetaT = sqrt(1.0f - sinThetaT2);
+                        float rOrth = (etaI * cosThetaI - etaT * cosThetaT) / (etaI * cosThetaI + etaT * cosThetaT);
+                        float rPar = (etaT * cosThetaI - etaI * cosThetaT) / (etaT * cosThetaI + etaI * cosThetaT);
+                        float fresnel = (rOrth * rOrth + rPar * rPar) * 0.5f;
+                        if (NextRandom(rngState) < fresnel) {
+                            ray.direction = reflect(incident, normal);
+                            ray.origin = hit.position + normal * 0.001f;
+                        } else {
+                            ray.direction = refract(incident, normal, eta);
+                            ray.origin = hit.position - normal * 0.001f;
+                        }
+                    }
+                    
+                    throughput *= EvaluateSpectralReflectance(hit.materialID, ray.wavelength, hit.position);
+                    continue;
+                }
+                
+                if (hit.materialID == 2 || hit.materialID == 3) {
+                    float3 targetDir = normalize(hit.normal + RandomInUnitSphere(rngState));
+                    ray.direction = targetDir;
+                    ray.origin = hit.position + hit.normal * 0.001f;
+                    throughput *= EvaluateSpectralReflectance(hit.materialID, ray.wavelength, hit.position);
+                    
+                    // OPTIMIZATION: Russian Roulette path termination after 2 bounces
+                    if (i >= 2) {
+                        float continuationProbability = clamp(throughput, 0.05f, 0.95f);
+                        if (NextRandom(rngState) > continuationProbability) break;
+                        throughput /= continuationProbability;
+                    }
+                }
+            } else {
+                if (i == 0) sampleHitSkyDirectly = true;
+                else finalSpectralRadiance += EvaluateSkyEmission(ray.wavelength, ray.direction) * throughput;
+                break;
+            }
+        }
+
+        if (sampleHitSkyDirectly) {
+            skyPixelsAccumulator += 1.0f;
+        } else if (sensorPlaneHit) {
+            accumulatedFrameRGB += collectedSensorRGB;
+        } else {
+            float3 sceneSampleRGB = max(XYZToRGB(WavelengthToXYZ(ray.wavelength) * finalSpectralRadiance * (400.0f * 0.00535f)), 0.0f);
+            sceneSampleRGB = min(sceneSampleRGB, float3(1e4f, 1e4f, 1e4f));
+            accumulatedFrameRGB += sceneSampleRGB;
+        }
+    }
+
+    float3 frameRGB = float3(0.0f, 0.0f, 0.0f);
+    bool hitSkyDirectly = (skyPixelsAccumulator / (float)SAMPLES_PER_FRAME) > 0.5f;
+    if (hitSkyDirectly) frameRGB = float3(0.0f, 0.0f, 0.0f);
+    else frameRGB = accumulatedFrameRGB / (float)SAMPLES_PER_FRAME;
+
+    float blendFactor = 1.0f / (float)_SampleIndex;
+    float3 accumulatedRGB = lerp(AccumulationBuffer[id.xy].xyz, frameRGB, blendFactor);
+    AccumulationBuffer[id.xy] = float4(accumulatedRGB, 1.0f);
+    
+    Result[id.xy] = float4(pow(accumulatedRGB / (accumulatedRGB + 1.0f), 1.0f / 2.2f), 1.0f);
+}

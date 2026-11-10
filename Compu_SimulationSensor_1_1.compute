@@ -1,0 +1,262 @@
+#pragma kernel CSMain
+
+#define SAMPLES_PER_FRAME 64
+
+struct Ray {
+    float3 origin;
+    float3 direction;
+    float wavelength; 
+};
+
+struct HitRecord {
+    bool didIntersect;
+    float t;
+    float3 position;
+    float3 normal;
+    int materialID;    
+};
+
+// --- Buffers & Textures ---
+Texture2D<float4> BackgroundSource;      
+Texture2D<float> _CameraDepthTexture;    
+RWTexture2D<float4> Result;              
+RWTexture2D<float4> AccumulationBuffer;
+
+SamplerState sampler_linear_clamp;
+
+// --- Uniforms & Transform Matrices ---
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+float4 _ZBufferParams;
+float _Time;
+int _SampleIndex;
+
+float4 _LightPosition;
+float _LightIntensity; 
+float _IntensityClamp; 
+
+// --- PRNG Subsystem ---
+uint GenerateSeed(uint2 id, uint width, float time) {
+    uint timeSeed = asuint(time);
+    uint state = id.y * width + id.x;
+    state ^= timeSeed;
+    state = state * 277803737u + 289133645u;
+    return state;
+}
+
+float NextRandom(inout uint state) {
+    state = state * 747796405u + 289133645u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (float)((word >> 22u) ^ word) / 4294967295.0f;
+}
+
+float3 RandomInUnitSphere(inout uint state) {
+    while (true) {
+        float3 p = float3(NextRandom(state)*2.0f-1.0f, NextRandom(state)*2.0f-1.0f, NextRandom(state)*2.0f-1.0f);
+        if (dot(p, p) < 1.0f) return p;
+    }
+    return float3(0,0,0);
+}
+
+// --- Spectral Curve Data Evaluation ---
+float EvaluateEmission(int matID, float wavelength) {
+    if (matID == 4) return _LightIntensity; // Light emitting sphere
+    return 0.0f;
+}
+
+float EvaluateSkyEmission(float wavelength, float3 rayDir) {
+    return 0.0f;
+}
+
+float3 WavelengthToXYZ(float wave) {
+    float x1 = 1.065f * exp(-0.5f * ((wave - 595.8f) / 33.4f) * ((wave - 595.8f) / 33.4f));
+    float x2 = 0.366f * exp(-0.5f * ((wave - 446.8f) / 18.2f) * ((wave - 446.8f) / 18.2f));
+    return float3(x1 + x2, 1.014f * exp(-0.5f * ((wave - 556.4f) / 40.4f) * ((wave - 556.4f) / 40.4f)), 1.839f * exp(-0.5f * ((wave - 446.8f) / 22.7f) * ((wave - 446.8f) / 22.7f)));
+}
+
+float3 XYZToRGB(float3 xyz) {
+    return float3(2.975424f * xyz.x - 1.402930f * xyz.y - 0.453346f * xyz.z, -0.923164f * xyz.x + 1.832263f * xyz.y + 0.035174f * xyz.z, 0.053158f * xyz.x - 1.936616f * xyz.y + 1.050730f * xyz.z);
+}
+
+// --- Intersections ---
+void IntersectSphere(Ray ray, inout HitRecord bestHit, float3 center, float radius, int matID) {
+    float3 oc = ray.origin - center;
+    float b = dot(oc, ray.direction);
+    float c = dot(oc, oc) - radius * radius;
+    float discriminant = b * b - c;
+    if (discriminant < 0.0f) return;
+    float t = -b - sqrt(discriminant);
+    if (t <= 0.001f) t = -b + sqrt(discriminant);
+    if (t > 0.001f && t < bestHit.t) {
+        bestHit.didIntersect = true;
+        bestHit.t = t;
+        bestHit.position = ray.origin + t * ray.direction;
+        bestHit.normal = normalize(bestHit.position - center);
+        bestHit.materialID = matID;
+    }
+}
+
+void IntersectPlane(Ray ray, inout HitRecord bestHit, float3 planeOrigin, float3 planeNormal, int matID) {
+    float denom = dot(planeNormal, ray.direction);
+    if (abs(denom) > 1e-6f) {
+        float t = dot(planeOrigin - ray.origin, planeNormal) / denom;
+        if (t > 0.001f && t < bestHit.t) {
+            bestHit.didIntersect = true;
+            bestHit.t = t;
+            bestHit.position = ray.origin + t * ray.direction;
+            bestHit.normal = planeNormal; 
+            bestHit.materialID = matID;
+        }
+    }
+}
+
+// =========================================================================
+// RENDER PASS: SCREENSPACE SPECTRAL INTEGRATION SYSTEM
+// =========================================================================
+[numthreads(32, 32, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID) {
+    uint width, height;
+    Result.GetDimensions(width, height);
+    if (id.x >= width || id.y >= height) return;
+    
+    uint rngState = GenerateSeed(id.xy, width, _Time);
+    float2 uvJitterAA = (float2(id.xy) + float2(NextRandom(rngState), NextRandom(rngState))) / float2(width, height);
+    float2 uvScreen = float2(id.xy) / float2(width, height);
+    
+    // Sample Unity color and raw depth
+    float3 unityColor = BackgroundSource.SampleLevel(sampler_linear_clamp, uvScreen, 0).xyz;
+    float rawDepth = _CameraDepthTexture.SampleLevel(sampler_linear_clamp, uvScreen, 0);
+
+    // Check if a Unity opaque object exists at this pixel (handling reversed-Z where 0 is far)
+    #if defined(UNITY_REVERSED_Z)
+    bool hasUnityObject = (rawDepth > 0.00001f);
+    #else
+    bool hasUnityObject = (rawDepth < 0.99999f);
+    #endif
+
+    float4 centerClip = float4(uvScreen.x * 2.0f - 1.0f, uvScreen.y * 2.0f - 1.0f, 0.0f, 1.0f);
+    float4 centerView = mul(_CameraInverseProjection, centerClip); 
+    centerView /= centerView.w;
+    
+    Ray centerRay; 
+    centerRay.origin = _CameraToWorld._m03_m13_m23; 
+    centerRay.direction = normalize(mul(_CameraToWorld, float4(centerView.xyz, 0.0f)).xyz);
+    centerRay.wavelength = 0.0f;
+
+    float4 jitterClip = float4(uvJitterAA.x * 2.0f - 1.0f, uvJitterAA.y * 2.0f - 1.0f, 0.0f, 1.0f);
+    float4 jitterView = mul(_CameraInverseProjection, jitterClip);
+    jitterView /= jitterView.w;
+    
+    Ray jitterRay; 
+    jitterRay.origin = centerRay.origin; 
+    jitterRay.direction = normalize(mul(_CameraToWorld, float4(jitterView.xyz, 0.0f)).xyz);
+    jitterRay.wavelength = 0.0f;
+
+    // Intersect path-traced geometry with the primary ray
+    HitRecord centerHit; 
+    centerHit.didIntersect = false; 
+    centerHit.t = 1e20f;
+    centerHit.position = float3(0, 0, 0);
+    centerHit.normal = float3(0, 0, 0);
+    centerHit.materialID = 0;
+
+    IntersectPlane(centerRay, centerHit, float3(0.0f, -1.5f, 0.0f), float3(0.0f, 1.0f, 0.0f), 2); // Floor Plane
+    IntersectSphere(centerRay, centerHit, _LightPosition.xyz, 0.2f, 4); // Light source
+
+    // --- ACCURATE DEPTH SUPERPOSITION TEST ---
+    bool drawUnityObject = false;
+    if (hasUnityObject) {
+        // Reconstruct true linear eye depth from Unity's depth buffer
+        float unityEyeDepth = 1.0f / (_ZBufferParams.z * rawDepth + _ZBufferParams.w);
+        
+        // Project ray-traced hit distance onto the camera's view direction vector (z-depth)
+        float rayViewDepth = 1e20f;
+        if (centerHit.didIntersect) {
+            float3 camForward = normalize(_CameraToWorld._m02_m12_m22);
+            rayViewDepth = dot(centerHit.position - centerRay.origin, camForward);
+        }
+
+        // If Unity object is closer than path-traced geometry (or path tracer hit nothing), draw Unity object
+        if (!centerHit.didIntersect || unityEyeDepth < rayViewDepth) {
+            drawUnityObject = true;
+        }
+    }
+
+    if (drawUnityObject) {
+        float blendFactor = 1.0f / (float)_SampleIndex;
+        float3 accumulatedRGB = lerp(AccumulationBuffer[id.xy].xyz, unityColor, blendFactor);
+        AccumulationBuffer[id.xy] = float4(accumulatedRGB, 1.0f);
+        Result[id.xy] = float4(pow(accumulatedRGB / (accumulatedRGB + 1.0f), 1.0f / 2.2f), 1.0f);
+        return;
+    }
+
+    // Otherwise, execute the path tracer for the ray-traced geometry
+    float3 accumulatedFrameRGB = float3(0.0f, 0.0f, 0.0f);
+    float skyPixelsAccumulator = 0.0f;
+
+    [loop]
+    for (int smpl = 0; smpl < SAMPLES_PER_FRAME; smpl++) {
+        Ray ray;
+        ray.origin = jitterRay.origin;
+        ray.direction = jitterRay.direction;
+        ray.wavelength = 380.0f + NextRandom(rngState) * 400.0f;
+        
+        float throughput = 1.0f;
+        float finalSpectralRadiance = 0.0f;
+        bool sampleHitSkyDirectly = false;
+        int maxBounces = 4;
+
+        [loop]
+        for (int i = 0; i < maxBounces; i++) {
+            HitRecord hit;
+            hit.didIntersect = false; 
+            hit.t = 1e20f;
+            hit.position = float3(0, 0, 0);
+            hit.normal = float3(0, 0, 0);
+            hit.materialID = 0;
+
+            IntersectPlane(ray, hit, float3(0.0f, -1.5f, 0.0f), float3(0.0f, 1.0f, 0.0f), 2);
+            IntersectSphere(ray, hit, _LightPosition.xyz, 0.2f, 4);
+
+            if (hit.didIntersect) {
+                if (hit.materialID == 4) {
+                    float rawEmission = EvaluateEmission(hit.materialID, ray.wavelength) * throughput;
+                    finalSpectralRadiance += min(rawEmission, _IntensityClamp);
+                    break;
+                }
+                
+                if (hit.materialID == 2) {
+                    float3 targetDir = normalize(hit.normal + RandomInUnitSphere(rngState));
+                    ray.direction = targetDir;
+                    ray.origin = hit.position + hit.normal * 0.001f;
+                    throughput *= 0.8f;
+                    
+                    if (NextRandom(rngState) > throughput) break;
+                }
+            } else {
+                if (i == 0) sampleHitSkyDirectly = true;
+                else finalSpectralRadiance += EvaluateSkyEmission(ray.wavelength, ray.direction) * throughput;
+                break;
+            }
+        }
+
+        if (sampleHitSkyDirectly) {
+            skyPixelsAccumulator += 1.0f;
+        } else {
+            float3 sceneSampleRGB = max(XYZToRGB(WavelengthToXYZ(ray.wavelength) * finalSpectralRadiance * (400.0f * 0.00535f)), 0.0f);
+            sceneSampleRGB = min(sceneSampleRGB, float3(1e4f, 1e4f, 1e4f));
+            accumulatedFrameRGB += sceneSampleRGB;
+        }
+    }
+
+    float3 frameRGB = float3(0.0f, 0.0f, 0.0f);
+    bool hitSkyDirectly = (skyPixelsAccumulator / (float)SAMPLES_PER_FRAME) > 0.5f;
+    if (hitSkyDirectly) frameRGB = float3(0.0f, 0.0f, 0.0f);
+    else frameRGB = accumulatedFrameRGB / (float)SAMPLES_PER_FRAME;
+
+    float blendFactor = 1.0f / (float)_SampleIndex;
+    float3 accumulatedRGB = lerp(AccumulationBuffer[id.xy].xyz, frameRGB, blendFactor);
+    AccumulationBuffer[id.xy] = float4(accumulatedRGB, 1.0f);
+    
+    Result[id.xy] = float4(pow(accumulatedRGB / (accumulatedRGB + 1.0f), 1.0f / 2.2f), 1.0f);
+}

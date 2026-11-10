@@ -1,0 +1,516 @@
+#pragma kernel CSMain
+
+#define SAMPLES_PER_FRAME 16
+
+// --- Arrow rotation settings ---
+#define ARROW_ROTATION_AXIS  float3(0.0f, 1.0f, 0.0f)   
+#define ARROW_ROTATION_SPEED 1.0f                       
+#define ARROW_BASE_DIRECTION float3(1.0f, 1.0f, 1.0f)   
+
+// --- Sensor settings ---
+float3 _SensorCenter;        
+float2 _SensorHalfSize;      
+float4 _SensorColor;         
+float  _HousingApertureRadius;
+float  _HousingWallThickness;
+
+struct Ray {
+    float3 origin;
+    float3 direction;
+    float wavelength; 
+};
+
+struct HitRecord {
+    bool didIntersect;
+    float t;
+    float3 position;
+    float3 normal;
+    int materialID;    
+};
+
+RWTexture2D<float4> Result;              
+RWTexture2D<float4> AccumulationBuffer;  
+
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+float _Time;
+int _SampleIndex;
+
+float4 _LightPosition;
+float _LightIntensity; 
+float _IntensityClamp;
+
+// --- PRNG Subsystem ---
+uint GenerateSeed(uint2 id, uint width, float time) {
+    uint timeSeed = asuint(time);
+    uint state = id.y * width + id.x;
+    state ^= timeSeed;
+    state = state * 277803737u + 289133645u;
+    return state;
+}
+
+float NextRandom(inout uint state) {
+    state = state * 747796405u + 289133645u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (float)((word >> 22u) ^ word) / 4294967295.0f;
+}
+
+float3 RotateAroundAxis(float3 v, float3 axis, float angle) {
+    axis = normalize(axis);
+    float s = sin(angle);
+    float c = cos(angle);
+    return v * c + cross(axis, v) * s + axis * dot(axis, v) * (1.0f - c);
+}
+
+// --- Intersections ---
+void IntersectSphere(Ray ray, inout HitRecord bestHit, float3 center, float radius, int matID) {
+    float3 oc = ray.origin - center;
+    float b = dot(oc, ray.direction);
+    float c = dot(oc, oc) - radius * radius;
+    float discriminant = b * b - c;
+    if (discriminant < 0.0f) return;
+    float t = -b - sqrt(discriminant);
+    if (t <= 0.001f) t = -b + sqrt(discriminant);
+    if (t > 0.001f && t < bestHit.t) {
+        bestHit.didIntersect = true;
+        bestHit.t = t;
+        bestHit.position = ray.origin + t * ray.direction;
+        bestHit.normal = normalize(bestHit.position - center);
+        bestHit.materialID = matID;
+    }
+}
+
+void IntersectPlane(Ray ray, inout HitRecord bestHit, float3 planeOrigin, float3 planeNormal, int matID) {
+    float denom = dot(planeNormal, ray.direction);
+    if (abs(denom) > 1e-6f) {
+        float t = dot(planeOrigin - ray.origin, planeNormal) / denom;
+        if (t > 0.001f && t < bestHit.t) {
+            bestHit.didIntersect = true;
+            bestHit.t = t;
+            bestHit.position = ray.origin + t * ray.direction;
+            bestHit.normal = planeNormal; 
+            bestHit.materialID = matID;
+        }
+    }
+}
+
+void IntersectSensorPlane(Ray ray, inout HitRecord bestHit, float3 center, float halfWidth, float halfDepth, int matID) {
+    float3 normal = float3(0.0f, -1.0f, 0.0f);
+    float denom = dot(normal, ray.direction);
+    if (abs(denom) > 1e-6f) {
+        float t = dot(center - ray.origin, normal) / denom;
+        if (t > 0.001f && t < bestHit.t) {
+            float3 hitPos = ray.origin + t * ray.direction;
+            float2 localPos = hitPos.xz - center.xz;
+            if (abs(localPos.x) <= halfWidth && abs(localPos.y) <= halfDepth) {
+                bestHit.didIntersect = true;
+                bestHit.t = t;
+                bestHit.position = hitPos;
+                bestHit.normal = (denom < 0.0f) ? normal : -normal;
+                bestHit.materialID = matID;
+            }
+        }
+    }
+}
+
+// --- Solid Sensor Housing with Thick Walls, Thick Floor, and Walled Pinhole Aperture ---
+void IntersectSensorHousing(Ray ray, inout HitRecord bestHit, float3 sensorCenter, float2 outerHalfSize, float wallThickness, float apertureRadius, int matID) {
+    float maxY = sensorCenter.y;                       
+    float minY = sensorCenter.y - 0.90f;               
+    float floorThickness = wallThickness;
+    float innerBottomY = minY + floorThickness;
+    float2 innerHalfSize = outerHalfSize - float2(wallThickness, wallThickness);
+
+    // 1. Outer Bottom Floor (y = minY, outside aperture)
+    float denomBottom = dot(float3(0, 1, 0), ray.direction);
+    if (abs(denomBottom) > 1e-6f) {
+        float t = (minY - ray.origin.y) / denomBottom;
+        if (t > 0.001f && t < bestHit.t) {
+            float3 p = ray.origin + t * ray.direction;
+            float2 dCenter = p.xz - sensorCenter.xz;
+            if (abs(dCenter.x) <= outerHalfSize.x && abs(dCenter.y) <= outerHalfSize.y) {
+                if (dot(dCenter, dCenter) > apertureRadius * apertureRadius) {
+                    bestHit.didIntersect = true;
+                    bestHit.t = t;
+                    bestHit.position = p;
+                    bestHit.normal = float3(0, -1, 0);
+                    bestHit.materialID = matID;
+                }
+            }
+        }
+    }
+
+    // 2. Inner Bottom Floor (y = innerBottomY, outside aperture)
+    if (abs(denomBottom) > 1e-6f) {
+        float t = (innerBottomY - ray.origin.y) / denomBottom;
+        if (t > 0.001f && t < bestHit.t) {
+            float3 p = ray.origin + t * ray.direction;
+            float2 dCenter = p.xz - sensorCenter.xz;
+            if (abs(dCenter.x) <= innerHalfSize.x && abs(dCenter.y) <= innerHalfSize.y) {
+                if (dot(dCenter, dCenter) > apertureRadius * apertureRadius) {
+                    bestHit.didIntersect = true;
+                    bestHit.t = t;
+                    bestHit.position = p;
+                    bestHit.normal = float3(0, 1, 0);
+                    bestHit.materialID = matID;
+                }
+            }
+        }
+    }
+
+    // 3. Walled Pinhole Aperture (Cylindrical collar lining the hole from minY to innerBottomY)
+    float2 dRayOriginXZ = ray.origin.xz - sensorCenter.xz;
+    float a = dot(ray.direction.xz, ray.direction.xz);
+    if (a > 1e-6f) {
+        float b = dot(dRayOriginXZ, ray.direction.xz);
+        float c = dot(dRayOriginXZ, dRayOriginXZ) - apertureRadius * apertureRadius;
+        float discriminant = b * b - a * c;
+        if (discriminant >= 0.0f) {
+            float sq = sqrt(discriminant);
+            float t1 = (-b - sq) / a;
+            float t2 = (-b + sq) / a;
+            [unroll]
+            for (int k = 0; k < 2; k++) {
+                float tCyl = (k == 0) ? t1 : t2;
+                if (tCyl > 0.001f && tCyl < bestHit.t) {
+                    float3 p = ray.origin + tCyl * ray.direction;
+                    if (p.y >= minY && p.y <= innerBottomY) {
+                        bestHit.didIntersect = true;
+                        bestHit.t = tCyl;
+                        bestHit.position = p;
+                        bestHit.normal = normalize(float3(p.x - sensorCenter.x, 0.0f, p.z - sensorCenter.z));
+                        bestHit.materialID = matID;
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Outer Vertical Walls (from minY to maxY)
+    float tWall;
+    float xBounds[2] = { sensorCenter.x - outerHalfSize.x, sensorCenter.x + outerHalfSize.x };
+    float zBounds[2] = { sensorCenter.z - outerHalfSize.y, sensorCenter.z + outerHalfSize.y };
+    
+    if (abs(ray.direction.x) > 1e-6f) {
+        [unroll]
+        for (int i = 0; i < 2; i++) {
+            tWall = (xBounds[i] - ray.origin.x) / ray.direction.x;
+            if (tWall > 0.001f && tWall < bestHit.t) {
+                float3 p = ray.origin + tWall * ray.direction;
+                if (p.y >= minY && p.y <= maxY && abs(p.z - sensorCenter.z) <= outerHalfSize.y) {
+                    bestHit.didIntersect = true;
+                    bestHit.t = tWall;
+                    bestHit.position = p;
+                    float normalSign = (i == 0) ? -1.0f : 1.0f;
+                    bestHit.normal = float3(normalSign, 0, 0);
+                    bestHit.materialID = matID;
+                }
+            }
+        }
+    }
+
+    if (abs(ray.direction.z) > 1e-6f) {
+        [unroll]
+        for (int j = 0; j < 2; j++) {
+            tWall = (zBounds[j] - ray.origin.z) / ray.direction.z;
+            if (tWall > 0.001f && tWall < bestHit.t) {
+                float3 p = ray.origin + tWall * ray.direction;
+                if (p.y >= minY && p.y <= maxY && abs(p.x - sensorCenter.x) <= outerHalfSize.x) {
+                    bestHit.didIntersect = true;
+                    bestHit.t = tWall;
+                    bestHit.position = p;
+                    float normalSign = (j == 0) ? -1.0f : 1.0f;
+                    bestHit.normal = float3(0, 0, normalSign);
+                    bestHit.materialID = matID;
+                }
+            }
+        }
+    }
+
+    // 5. Inner Cavity Walls (from innerBottomY to maxY)
+    float xInnerBounds[2] = { sensorCenter.x - innerHalfSize.x, sensorCenter.x + innerHalfSize.x };
+    float zInnerBounds[2] = { sensorCenter.z - innerHalfSize.y, sensorCenter.z + innerHalfSize.y };
+
+    if (abs(ray.direction.x) > 1e-6f) {
+        [unroll]
+        for (int ii = 0; ii < 2; ii++) {
+            tWall = (xInnerBounds[ii] - ray.origin.x) / ray.direction.x;
+            if (tWall > 0.001f && tWall < bestHit.t) {
+                float3 p = ray.origin + tWall * ray.direction;
+                if (p.y >= innerBottomY && p.y <= maxY && abs(p.z - sensorCenter.z) <= innerHalfSize.y) {
+                    bestHit.didIntersect = true;
+                    bestHit.t = tWall;
+                    bestHit.position = p;
+                    float normalSign = (ii == 0) ? 1.0f : -1.0f;
+                    bestHit.normal = float3(normalSign, 0, 0);
+                    bestHit.materialID = matID;
+                }
+            }
+        }
+    }
+
+    if (abs(ray.direction.z) > 1e-6f) {
+        [unroll]
+        for (int jj = 0; jj < 2; jj++) {
+            tWall = (zInnerBounds[jj] - ray.origin.z) / ray.direction.z;
+            if (tWall > 0.001f && tWall < bestHit.t) {
+                float3 p = ray.origin + tWall * ray.direction;
+                if (p.y >= innerBottomY && p.y <= maxY && abs(p.x - sensorCenter.x) <= innerHalfSize.x) {
+                    bestHit.didIntersect = true;
+                    bestHit.t = tWall;
+                    bestHit.position = p;
+                    float normalSign = (jj == 0) ? 1.0f : -1.0f;
+                    bestHit.normal = float3(0, 0, normalSign);
+                    bestHit.materialID = matID;
+                }
+            }
+        }
+    }
+}
+
+void IntersectBillboardAxis(Ray ray, inout HitRecord bestHit, float3 axisDir, float width, int matID) {
+    float3 camForward = _CameraToWorld._m02_m12_m22;
+    float3 s = cross(axisDir, camForward);
+    if (dot(s, s) < 1e-4f) {
+        s = cross(axisDir, _CameraToWorld._m01_m11_m21); 
+    }
+    s = normalize(s);
+    float3 n = normalize(cross(axisDir, s));
+    
+    float denom = dot(n, ray.direction);
+    if (abs(denom) > 1e-6f) {
+        float t = -dot(n, ray.origin) / denom;
+        if (t > 0.001f && t < bestHit.t) {
+            float3 hitPos = ray.origin + t * ray.direction;
+            float sideCoord = dot(hitPos, s);
+            if (abs(sideCoord) <= width * 0.5f) {
+                bestHit.didIntersect = true;
+                bestHit.t = t;
+                bestHit.position = hitPos;
+                bestHit.normal = (denom < 0.0f) ? n : -n;
+                bestHit.materialID = matID;
+            }
+        }
+    }
+}
+
+void IntersectCylinder(Ray ray, inout HitRecord bestHit, float3 origin, float3 dir, float length, float radius, int matID) {
+    float3 u = normalize(dir);
+    float3 o = ray.origin - origin;
+    float3 d = ray.direction;
+    
+    float3 d_proj = d - dot(d, u) * u;
+    float3 o_proj = o - dot(o, u) * u;
+    
+    float a = dot(d_proj, d_proj);
+    float b = 2.0f * dot(o_proj, d_proj);
+    float c = dot(o_proj, o_proj) - radius * radius;
+    float discriminant = b * b - 4.0f * a * c;
+
+    if (discriminant >= 0.0f && a > 1e-6f) {
+        float sqrtDisc = sqrt(discriminant);
+        float t1 = (-b - sqrtDisc) / (2.0f * a);
+        float t2 = (-b + sqrtDisc) / (2.0f * a);
+        
+        float tCyl = (t1 > 0.001f) ? t1 : t2;
+        if (tCyl > 0.001f && tCyl < bestHit.t) {
+            float3 hitPos = ray.origin + tCyl * ray.direction;
+            float h = dot(hitPos - origin, u);
+            if (h >= 0.0f && h <= length) {
+                bestHit.didIntersect = true;
+                bestHit.t = tCyl;
+                bestHit.position = hitPos;
+                bestHit.normal = normalize((hitPos - origin) - u * h);
+                bestHit.materialID = matID;
+            }
+        }
+    }
+}
+
+void IntersectCone(Ray ray, inout HitRecord bestHit, float3 tip, float3 dir, float height, float radius, int matID) {
+    float3 u = normalize(dir);
+    float3 vAxis = -u; 
+    float3 CO = ray.origin - tip;
+    
+    float h2 = height * height;
+    float r2 = radius * radius;
+    float cos2 = h2 / (h2 + r2);
+    
+    float dDotV = dot(ray.direction, vAxis);
+    float coDotV = dot(CO, vAxis);
+    float dDotD = dot(ray.direction, ray.direction);
+    float coDotCO = dot(CO, CO);
+    
+    float a = dDotV * dDotV - dDotD * cos2;
+    float b = 2.0f * (dDotV * coDotV - dot(ray.direction, CO) * cos2);
+    float c = coDotV * coDotV - coDotCO * cos2;
+    
+    float discriminant = b * b - 4.0f * a * c;
+    if (discriminant >= 0.0f && abs(a) > 1e-6f) {
+        float sqrtDisc = sqrt(discriminant);
+        float t1 = (-b - sqrtDisc) / (2.0f * a);
+        float t2 = (-b + sqrtDisc) / (2.0f * a);
+        
+        float candidateT = 1e20f;
+        float candidateH = 0.0f;
+        bool valid1 = false, valid2 = false;
+        float h1 = 0.0f, h2_val = 0.0f;
+        
+        if (t1 > 0.001f) {
+            float3 hp1 = ray.origin + t1 * ray.direction;
+            h1 = dot(hp1 - tip, vAxis);
+            if (h1 >= 0.0f && h1 <= height) valid1 = true;
+        }
+        if (t2 > 0.001f) {
+            float3 hp2 = ray.origin + t2 * ray.direction;
+            h2_val = dot(hp2 - tip, vAxis);
+            if (h2_val >= 0.0f && h2_val <= height) valid2 = true;
+        }
+        
+        if (valid1 && valid2) {
+            candidateT = min(t1, t2);
+            candidateH = (candidateT == t1) ? h1 : h2_val;
+        } else if (valid1) {
+            candidateT = t1;
+            candidateH = h1;
+        } else if (valid2) {
+            candidateT = t2;
+            candidateH = h2_val;
+        }
+        
+        if (candidateT > 0.001f && candidateT < bestHit.t) {
+            float3 hitPos = ray.origin + candidateT * ray.direction;
+            bestHit.didIntersect = true;
+            bestHit.t = candidateT;
+            bestHit.position = hitPos;
+            
+            float3 radial = (hitPos - tip) - candidateH * vAxis;
+            float3 normal = normalize(radial * height - vAxis * radius);
+            if (dot(normal, ray.direction) > 0.0f) normal = -normal;
+            bestHit.normal = normal;
+            bestHit.materialID = matID;
+        }
+    }
+}
+
+[numthreads(32, 32, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID) {
+    uint width, height;
+    Result.GetDimensions(width, height);
+    if (id.x >= width || id.y >= height) return;
+    
+    uint rngState = GenerateSeed(id.xy, width, _Time);
+    float2 uvJitterAA = (float2(id.xy) + float2(NextRandom(rngState), NextRandom(rngState))) / float2(width, height);
+    
+    float4 jitterClip = float4(uvJitterAA.x * 2.0f - 1.0f, uvJitterAA.y * 2.0f - 1.0f, 0.0f, 1.0f);
+    float4 jitterView = mul(_CameraInverseProjection, jitterClip); 
+    jitterView /= jitterView.w;
+    
+    Ray jitterRay; 
+    jitterRay.origin = _CameraToWorld._m03_m13_m23;
+    jitterRay.direction = normalize(mul(_CameraToWorld, float4(jitterView.xyz, 0.0f)).xyz);
+    jitterRay.wavelength = 0.0f;
+
+    float3 arrowOrigin = float3(0.0f, 0.0f, 0.0f);
+    float3 arrowDir = normalize(RotateAroundAxis(normalize(ARROW_BASE_DIRECTION), ARROW_ROTATION_AXIS, _Time * ARROW_ROTATION_SPEED));
+    float arrowTotalLength = 5.0f;
+    float arrowHeadLength = 0.8f;
+    float arrowShaftLength = arrowTotalLength - arrowHeadLength;
+    float3 arrowTipPos = arrowOrigin + arrowDir * arrowTotalLength;
+
+    float3 accumulatedFrameRGB = float3(0.0f, 0.0f, 0.0f);
+    int arrowPrimaryHits = 0;
+
+    [loop]
+    for (int smpl = 0; smpl < SAMPLES_PER_FRAME; smpl++) 
+    {
+        Ray ray;
+        ray.origin = jitterRay.origin;
+        ray.direction = jitterRay.direction;
+        
+        HitRecord hit;
+        hit.didIntersect = false; 
+        hit.t = 1e20f;
+        hit.position = float3(0, 0, 0);
+        hit.normal = float3(0, 0, 0);
+        hit.materialID = 0;
+
+        // Bottom floor plane (ID 2)
+        IntersectPlane(ray, hit, float3(0.0f, -1.5f, 0.0f), float3(0.0f, 1.0f, 0.0f), 2);
+        
+        // Light source sphere (ID 4)
+        IntersectSphere(ray, hit, _LightPosition.xyz, 0.2f, 4);
+
+        // Axis lines (IDs 5, 6, 7)
+        IntersectBillboardAxis(ray, hit, float3(1.0f, 0.0f, 0.0f), 0.04f, 5); 
+        IntersectBillboardAxis(ray, hit, float3(0.0f, 1.0f, 0.0f), 0.04f, 6); 
+        IntersectBillboardAxis(ray, hit, float3(0.0f, 0.0f, 1.0f), 0.04f, 7); 
+
+        // Vector / Arrow (ID 8)
+        IntersectCylinder(ray, hit, arrowOrigin, arrowDir, arrowShaftLength, 0.04f, 8);
+        IntersectCone(ray, hit, arrowTipPos, arrowDir, arrowHeadLength, 0.15f, 8);
+
+        // Sensor plane (ID 10) & Solid Sensor Housing with walled pinhole (ID 14)
+        IntersectSensorPlane(ray, hit, _SensorCenter, _SensorHalfSize.x, _SensorHalfSize.y, 10);
+        IntersectSensorHousing(ray, hit, _SensorCenter, _SensorHalfSize + float2(0.20f, 0.20f), _HousingWallThickness, _HousingApertureRadius, 14);
+
+        if (hit.didIntersect) {
+            if (hit.materialID == 4) {
+                float3 emissionColor = float3(1.0f, 0.95f, 0.8f) * (_LightIntensity * 0.001f);
+                accumulatedFrameRGB += emissionColor;
+                break;
+            }
+            if (hit.materialID == 2) {
+                float3 lightDir = normalize(_LightPosition.xyz - hit.position);
+                float ndl = saturate(dot(hit.normal, lightDir));
+                float3 floorColor = float3(0.2f, 0.2f, 0.22f) * (0.2f + 0.8f * ndl);
+                accumulatedFrameRGB += floorColor;
+                break;
+            }
+            if (hit.materialID >= 5 && hit.materialID <= 7) {
+                float3 axisColor = (hit.materialID == 5) ? float3(5.0f, 0.1f, 0.1f) :
+                                   (hit.materialID == 6) ? float3(0.1f, 5.0f, 0.1f) :
+                                                           float3(0.1f, 0.1f, 5.0f);
+                accumulatedFrameRGB += axisColor;
+                break;
+            }
+            if (hit.materialID == 8) {
+                if (smpl == 0) arrowPrimaryHits++;
+                float3 arrowColor = float3(5.0f, 4.0f, 0.1f); 
+                accumulatedFrameRGB += arrowColor;
+                break;
+            }
+            if (hit.materialID == 10) {
+                accumulatedFrameRGB += _SensorColor.rgb;
+                break;
+            }
+            if (hit.materialID == 14) {
+                float3 lightDir = normalize(_LightPosition.xyz - hit.position);
+                float ndl = saturate(dot(hit.normal, lightDir));
+                float3 housingColor = float3(0.12f, 0.13f, 0.15f) * (0.2f + 0.8f * ndl);
+                accumulatedFrameRGB += housingColor;
+                break;
+            }
+        }
+    }
+
+    float3 frameRGB = accumulatedFrameRGB / (float)SAMPLES_PER_FRAME;
+
+    float4 prevAccum = AccumulationBuffer[id.xy];
+    float prevCount = min(prevAccum.w, (float)(_SampleIndex - 1));
+
+    float newCount;
+    float blendFactor;
+    if (arrowPrimaryHits > 0) {
+        blendFactor = 1.0f;       
+        newCount = 0.0f;          
+    } else {
+        blendFactor = 1.0f / (prevCount + 1.0f);
+        newCount = prevCount + 1.0f;
+    }
+
+    float3 accumulatedRGB = lerp(prevAccum.xyz, frameRGB, blendFactor);
+    AccumulationBuffer[id.xy] = float4(accumulatedRGB, newCount);
+    
+    Result[id.xy] = float4(pow(accumulatedRGB / (accumulatedRGB + 1.0f), 1.0f / 2.2f), 1.0f);
+}
